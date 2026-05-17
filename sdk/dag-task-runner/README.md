@@ -43,7 +43,9 @@ Run the included example DAG end-to-end:
 pnpm example
 ```
 
-The example builds a tiny single-file CLI todo app. Tasks run against `process.cwd()` by default, so use a scratch directory if you don't want files written into the cookbook:
+The package script runs subagents in `.canvas/dag-example-workdir` so the demo's generated `todo.mjs`, `todos.json`, tests, and README stay out of the source tree.
+
+The example builds a tiny single-file CLI todo app. If you invoke `pnpm dev` directly, tasks run against `process.cwd()` by default, so pass a scratch `--cwd` if you don't want files written into the cookbook:
 
 ```bash
 mkdir -p /tmp/dag-demo && cd /tmp/dag-demo
