@@ -337,12 +337,8 @@ async function runTask(
     ? `${upstreamContext}\n\n---\n\n${task.subtask_prompt}`
     : task.subtask_prompt;
 
-  const agent = await Agent.create({
-    apiKey: process.env.CURSOR_API_KEY!,
-    model: { id: ts.model },
-    local: { cwd },
-  });
-
+  const deadline = Date.now() + taskTimeoutMs;
+  let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
   let run: RunnerTaskRun | undefined;
   const buffer = new BoundedTextBuffer(STREAM_CAP);
   let lastPublishAt = 0;
@@ -354,10 +350,21 @@ async function runTask(
     writer.schedule(structuredCloneState(state));
     lastPublishAt = now;
   };
-  const deadline = Date.now() + taskTimeoutMs;
-
   try {
-    run = (await agent.send(stitched)) as RunnerTaskRun;
+    agent = await withTimeout(
+      Agent.create({
+        apiKey: process.env.CURSOR_API_KEY!,
+        model: { id: ts.model },
+        local: { cwd },
+      }),
+      remainingTaskMs(task.id, deadline, taskTimeoutMs, "creating agent"),
+      taskDeadlineExceededMessage(task.id, taskTimeoutMs, "creating agent"),
+    );
+    run = (await withTimeout(
+      agent.send(stitched),
+      remainingTaskMs(task.id, deadline, taskTimeoutMs, "sending prompt"),
+      taskDeadlineExceededMessage(task.id, taskTimeoutMs, "sending prompt"),
+    )) as RunnerTaskRun;
     const iterator = run.stream()[Symbol.asyncIterator]();
     while (true) {
       const timeoutForNext = Math.min(deadline - Date.now(), streamIdleTimeoutMs);
@@ -456,10 +463,12 @@ async function runTask(
       await bestEffortCancel(run, task.id);
     }
     publishIfDue(true);
-    try {
-      await (agent as unknown as AsyncDisposable)[Symbol.asyncDispose]();
-    } catch {
-      // ignore dispose errors
+    if (agent) {
+      try {
+        await (agent as unknown as AsyncDisposable)[Symbol.asyncDispose]();
+      } catch {
+        // ignore dispose errors
+      }
     }
     writer.schedule(structuredCloneState(state));
   }
@@ -513,6 +522,27 @@ function streamWaitTimeoutMessage({
     return `Task ${taskId} produced no stream events within ${effectiveTimeout} before the task deadline (configured stream idle timeout: ${formatMs(streamIdleTimeoutMs)})`;
   }
   return `Task ${taskId} produced no stream events within ${effectiveTimeout}`;
+}
+
+function remainingTaskMs(
+  taskId: string,
+  deadline: number,
+  taskTimeoutMs: number,
+  phase: string,
+): number {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) {
+    throw new TimeoutError(taskDeadlineExceededMessage(taskId, taskTimeoutMs, phase));
+  }
+  return remaining;
+}
+
+function taskDeadlineExceededMessage(
+  taskId: string,
+  taskTimeoutMs: number,
+  phase: string,
+): string {
+  return `Task ${taskId} exceeded deadline of ${formatMs(taskTimeoutMs)} while ${phase}`;
 }
 
 async function withTimeout<T>(
