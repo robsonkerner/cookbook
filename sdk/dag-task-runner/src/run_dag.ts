@@ -29,6 +29,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { parseDAG, computeRanks, createModelResolver, validateModelMap } from "./dag.js";
 import type { ModelMapOverride, RawTask } from "./dag.js";
@@ -51,7 +52,7 @@ interface CliArgs {
   initOnly: boolean;
 }
 
-interface RunnerTaskRun {
+export interface RunnerTaskRun {
   stream: () => AsyncIterable<unknown>;
   wait: () => Promise<{
     status: string;
@@ -61,6 +62,39 @@ interface RunnerTaskRun {
   cancel?: () => Promise<void> | void;
   status?: string;
   durationMs?: number;
+}
+
+export interface RunnerAgent {
+  send: (prompt: string) => Promise<RunnerTaskRun>;
+  [Symbol.asyncDispose]?: () => Promise<void> | void;
+}
+
+export type RunnerAgentFactory = () => Promise<RunnerAgent>;
+
+interface CanvasScheduler {
+  schedule(state: RunState): void;
+}
+
+interface ActiveRunRegistry {
+  add(run: RunnerTaskRun): void;
+  delete(run: RunnerTaskRun): void;
+  snapshot(): RunnerTaskRun[];
+}
+
+class ActiveRunTracker implements ActiveRunRegistry {
+  private readonly runs = new Set<RunnerTaskRun>();
+
+  add(run: RunnerTaskRun): void {
+    this.runs.add(run);
+  }
+
+  delete(run: RunnerTaskRun): void {
+    this.runs.delete(run);
+  }
+
+  snapshot(): RunnerTaskRun[] {
+    return [...this.runs];
+  }
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -185,6 +219,7 @@ async function main(): Promise<void> {
   );
 
   const writer = new CanvasWriter(args.canvasPath, args.debounceMs);
+  const activeRuns = new ActiveRunTracker();
   let finalized = false;
   let interrupting = false;
 
@@ -229,6 +264,7 @@ async function main(): Promise<void> {
     if (interrupting) return;
     interrupting = true;
     try {
+      await cancelActiveRuns(activeRuns);
       await markRunTerminated(state, message, outcome);
       writer.schedule(structuredCloneState(state));
       await writer.flush();
@@ -273,6 +309,7 @@ async function main(): Promise<void> {
               taskTimeoutMs: args.taskTimeoutMs,
               streamPublishMs: args.streamPublishMs,
               streamIdleTimeoutMs: args.streamIdleTimeoutMs,
+              activeRuns,
             },
           );
         }),
@@ -318,15 +355,21 @@ async function main(): Promise<void> {
   }
 }
 
-async function runTask(
+export async function runTask(
   task: RawTask,
   stateById: Map<string, TaskState>,
   state: RunState,
-  writer: CanvasWriter,
+  writer: CanvasScheduler,
   cwd: string,
   options: RunTaskOptions,
+  agentFactory: RunnerAgentFactory = () =>
+    Agent.create({
+      apiKey: process.env.CURSOR_API_KEY!,
+      model: { id: stateById.get(task.id)!.model },
+      local: { cwd },
+    }) as Promise<RunnerAgent>,
 ): Promise<void> {
-  const { taskTimeoutMs, streamPublishMs, streamIdleTimeoutMs } = options;
+  const { taskTimeoutMs, streamPublishMs, streamIdleTimeoutMs, activeRuns } = options;
   const ts = stateById.get(task.id)!;
   ts.status = "RUNNING";
   ts.startedAt = Date.now();
@@ -337,13 +380,9 @@ async function runTask(
     ? `${upstreamContext}\n\n---\n\n${task.subtask_prompt}`
     : task.subtask_prompt;
 
-  const agent = await Agent.create({
-    apiKey: process.env.CURSOR_API_KEY!,
-    model: { id: ts.model },
-    local: { cwd },
-  });
-
+  let agent: RunnerAgent | undefined;
   let run: RunnerTaskRun | undefined;
+  let sendTimedOut = false;
   const buffer = new BoundedTextBuffer(STREAM_CAP);
   let lastPublishAt = 0;
   const publishIfDue = (force = false): void => {
@@ -357,7 +396,50 @@ async function runTask(
   const deadline = Date.now() + taskTimeoutMs;
 
   try {
-    run = (await agent.send(stitched)) as RunnerTaskRun;
+    let createTimedOut = false;
+    const createPromise = agentFactory();
+    createPromise
+      .then((lateAgent) => {
+        if (createTimedOut) {
+          void bestEffortDispose(lateAgent, task.id);
+        }
+      })
+      .catch(() => {
+        // The awaited create path below records the error on the task.
+      });
+    agent = await withDeadline(
+      createPromise,
+      deadline,
+      `Task ${task.id} did not create an agent within ${formatMs(taskTimeoutMs)}`,
+    ).catch((createErr) => {
+      if (isTimeoutError(createErr)) {
+        createTimedOut = true;
+      }
+      throw createErr;
+    });
+    const sendPromise = agent.send(stitched);
+    sendPromise
+      .then((lateRun) => {
+        if (sendTimedOut) {
+          void bestEffortCancel(lateRun, task.id);
+        }
+      })
+      .catch(() => {
+        // The awaited send path below records the error on the task.
+      });
+    try {
+      run = await withDeadline(
+        sendPromise,
+        deadline,
+        `Task ${task.id} did not start within ${formatMs(taskTimeoutMs)}`,
+      );
+    } catch (sendErr) {
+      if (isTimeoutError(sendErr)) {
+        sendTimedOut = true;
+      }
+      throw sendErr;
+    }
+    activeRuns?.add(run);
     const iterator = run.stream()[Symbol.asyncIterator]();
     while (true) {
       const timeoutForNext = Math.min(deadline - Date.now(), streamIdleTimeoutMs);
@@ -455,11 +537,12 @@ async function runTask(
     if (run && run.status === "running") {
       await bestEffortCancel(run, task.id);
     }
+    if (run) {
+      activeRuns?.delete(run);
+    }
     publishIfDue(true);
-    try {
-      await (agent as unknown as AsyncDisposable)[Symbol.asyncDispose]();
-    } catch {
-      // ignore dispose errors
+    if (agent) {
+      await bestEffortDispose(agent, task.id);
     }
     writer.schedule(structuredCloneState(state));
   }
@@ -469,6 +552,7 @@ interface RunTaskOptions {
   taskTimeoutMs: number;
   streamPublishMs: number;
   streamIdleTimeoutMs: number;
+  activeRuns?: ActiveRunRegistry;
 }
 
 /** Cap on per-task `resultText` size — applies to live streaming and final state. */
@@ -481,6 +565,8 @@ const DEFAULT_STREAM_PUBLISH_MS = 500;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 /** Avoid hanging indefinitely in wait() when stream is already done. */
 const WAIT_AFTER_STREAM_GRACE_MS = 15 * 1000;
+/** Bound cleanup calls so shutdown cannot hang behind SDK cancellation/disposal. */
+const RUN_CLEANUP_TIMEOUT_MS = 5 * 1000;
 /** Chars of each parent's output included in the child prompt. */
 const UPSTREAM_SNIPPET_CAP = 2000;
 /** Raised listener ceiling to avoid false-positive AbortSignal warnings from SDK internals. */
@@ -533,17 +619,52 @@ async function withTimeout<T>(
   }
 }
 
+async function withDeadline<T>(
+  promise: Promise<T>,
+  deadline: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const timeoutMs = deadline - Date.now();
+  if (timeoutMs <= 0) {
+    throw new TimeoutError(timeoutMessage);
+  }
+  return withTimeout(promise, timeoutMs, timeoutMessage);
+}
+
 async function bestEffortCancel(
   run: { cancel?: () => Promise<void> | void },
   taskId: string,
 ): Promise<void> {
   if (typeof run.cancel !== "function") return;
   try {
-    await run.cancel();
+    await withTimeout(
+      Promise.resolve(run.cancel()),
+      RUN_CLEANUP_TIMEOUT_MS,
+      `Timed out canceling task ${taskId}`,
+    );
   } catch (cancelErr) {
     const msg = cancelErr instanceof Error ? cancelErr.message : String(cancelErr);
     console.error(`[dag-runner] failed to cancel timed-out task ${taskId}: ${msg}`);
   }
+}
+
+async function bestEffortDispose(agent: RunnerAgent, taskId: string): Promise<void> {
+  if (typeof agent[Symbol.asyncDispose] !== "function") return;
+  try {
+    await withTimeout(
+      Promise.resolve(agent[Symbol.asyncDispose]()),
+      RUN_CLEANUP_TIMEOUT_MS,
+      `Timed out disposing agent for task ${taskId}`,
+    );
+  } catch (disposeErr) {
+    const msg = disposeErr instanceof Error ? disposeErr.message : String(disposeErr);
+    console.error(`[dag-runner] failed to dispose agent for task ${taskId}: ${msg}`);
+  }
+}
+
+async function cancelActiveRuns(activeRuns: ActiveRunRegistry): Promise<void> {
+  const runs = activeRuns.snapshot();
+  await Promise.all(runs.map((run, idx) => bestEffortCancel(run, `active-${idx + 1}`)));
 }
 
 class BoundedTextBuffer {
@@ -647,7 +768,13 @@ function structuredCloneState(state: RunState): RunState {
   return JSON.parse(JSON.stringify(state)) as RunState;
 }
 
-main().catch((err) => {
-  console.error(`[dag-runner] fatal: ${err instanceof Error ? err.stack ?? err.message : err}`);
-  process.exit(1);
-});
+function isDirectRun(metaUrl: string): boolean {
+  return process.argv[1] !== undefined && pathToFileURL(process.argv[1]).href === metaUrl;
+}
+
+if (isDirectRun(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`[dag-runner] fatal: ${err instanceof Error ? err.stack ?? err.message : err}`);
+    process.exit(1);
+  });
+}
