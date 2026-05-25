@@ -640,7 +640,7 @@ async function bestEffortDispose(
 ): Promise<void> {
   try {
     await withTimeout(
-      agent[Symbol.asyncDispose](),
+      Promise.resolve(agent[Symbol.asyncDispose]()),
       SDK_CLEANUP_TIMEOUT_MS,
       `Dispose timed out after ${formatMs(SDK_CLEANUP_TIMEOUT_MS)}`,
     );
