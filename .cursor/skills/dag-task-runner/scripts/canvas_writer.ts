@@ -86,16 +86,21 @@ export class CanvasWriter {
 
   /** Force-flush any pending write and await disk completion. */
   async flush(): Promise<void> {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    const snapshot = this.pending;
-    this.pending = null;
-    const targetWriteSeq = snapshot ? this.enqueueWrite(snapshot) : this.writeSeq;
-    await this.inFlight;
-    if (targetWriteSeq > 0 && this.lastFailedWriteSeq === targetWriteSeq) {
-      throw this.lastWriteError;
+    while (true) {
+      if (this.timer) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      const snapshot = this.pending;
+      this.pending = null;
+      const targetWriteSeq = snapshot ? this.enqueueWrite(snapshot) : this.writeSeq;
+      await this.inFlight;
+      if (targetWriteSeq > 0 && this.lastFailedWriteSeq === targetWriteSeq) {
+        throw this.lastWriteError;
+      }
+      if (!this.pending) {
+        return;
+      }
     }
   }
 
