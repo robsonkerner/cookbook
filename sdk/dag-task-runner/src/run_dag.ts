@@ -635,11 +635,13 @@ async function bestEffortCancel(
 }
 
 async function disposeAgent(agent: RunnerAgent, taskId: string): Promise<void> {
-  const disposable = agent as unknown as Partial<AsyncDisposable>;
-  if (typeof disposable[Symbol.asyncDispose] !== "function") return;
+  const dispose = (agent as unknown as { [Symbol.asyncDispose]?: () => PromiseLike<void> })[
+    Symbol.asyncDispose
+  ];
+  if (typeof dispose !== "function") return;
   try {
     await withTimeout(
-      Promise.resolve(disposable[Symbol.asyncDispose].call(agent)),
+      Promise.resolve(dispose.call(agent)),
       ACTIVE_CLEANUP_TIMEOUT_MS,
       `Dispose timed out after ${formatMs(ACTIVE_CLEANUP_TIMEOUT_MS)}`,
     );
