@@ -63,6 +63,10 @@ interface RunnerTaskRun {
   durationMs?: number;
 }
 
+interface RunnerAgent extends AsyncDisposable {
+  send: (prompt: string) => Promise<unknown>;
+}
+
 function parseArgs(argv: string[]): CliArgs {
   const args: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
@@ -337,12 +341,8 @@ async function runTask(
     ? `${upstreamContext}\n\n---\n\n${task.subtask_prompt}`
     : task.subtask_prompt;
 
-  const agent = await Agent.create({
-    apiKey: process.env.CURSOR_API_KEY!,
-    model: { id: ts.model },
-    local: { cwd },
-  });
-
+  const deadline = Date.now() + taskTimeoutMs;
+  let agent: RunnerAgent | undefined;
   let run: RunnerTaskRun | undefined;
   const buffer = new BoundedTextBuffer(STREAM_CAP);
   let lastPublishAt = 0;
@@ -354,10 +354,40 @@ async function runTask(
     writer.schedule(structuredCloneState(state));
     lastPublishAt = now;
   };
-  const deadline = Date.now() + taskTimeoutMs;
 
   try {
-    run = (await agent.send(stitched)) as RunnerTaskRun;
+    const agentPromise = Agent.create({
+      apiKey: process.env.CURSOR_API_KEY!,
+      model: { id: ts.model },
+      local: { cwd },
+    }) as Promise<RunnerAgent>;
+    try {
+      agent = await withTimeout(
+        agentPromise,
+        timeRemainingOrThrow(task.id, deadline, taskTimeoutMs),
+        `Task ${task.id} timed out while creating SDK agent after ${formatMs(taskTimeoutMs)}`,
+      );
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        disposeLateAgent(agentPromise, task.id);
+      }
+      throw err;
+    }
+
+    const sendPromise = agent.send(stitched) as Promise<RunnerTaskRun>;
+    try {
+      run = await withTimeout(
+        sendPromise,
+        timeRemainingOrThrow(task.id, deadline, taskTimeoutMs),
+        `Task ${task.id} timed out while sending prompt after ${formatMs(taskTimeoutMs)}`,
+      );
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        cancelLateRun(sendPromise, task.id);
+      }
+      throw err;
+    }
+
     const iterator = run.stream()[Symbol.asyncIterator]();
     while (true) {
       const timeoutForNext = Math.min(deadline - Date.now(), streamIdleTimeoutMs);
@@ -456,11 +486,7 @@ async function runTask(
       await bestEffortCancel(run, task.id);
     }
     publishIfDue(true);
-    try {
-      await (agent as unknown as AsyncDisposable)[Symbol.asyncDispose]();
-    } catch {
-      // ignore dispose errors
-    }
+    await bestEffortDisposeAgent(agent, task.id);
     writer.schedule(structuredCloneState(state));
   }
 }
@@ -495,6 +521,14 @@ class TimeoutError extends Error {
 
 function isTimeoutError(err: unknown): boolean {
   return err instanceof TimeoutError;
+}
+
+function timeRemainingOrThrow(taskId: string, deadline: number, taskTimeoutMs: number): number {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    throw new TimeoutError(`Task ${taskId} exceeded deadline of ${formatMs(taskTimeoutMs)}`);
+  }
+  return remainingMs;
 }
 
 interface StreamWaitTimeoutMessageOptions {
@@ -544,6 +578,35 @@ async function bestEffortCancel(
     const msg = cancelErr instanceof Error ? cancelErr.message : String(cancelErr);
     console.error(`[dag-runner] failed to cancel timed-out task ${taskId}: ${msg}`);
   }
+}
+
+async function bestEffortDisposeAgent(
+  agent: AsyncDisposable | undefined,
+  taskId: string,
+): Promise<void> {
+  if (!agent) return;
+  try {
+    await agent[Symbol.asyncDispose]();
+  } catch (disposeErr) {
+    const msg = disposeErr instanceof Error ? disposeErr.message : String(disposeErr);
+    console.error(`[dag-runner] failed to dispose agent for task ${taskId}: ${msg}`);
+  }
+}
+
+function disposeLateAgent(agentPromise: Promise<RunnerAgent>, taskId: string): void {
+  void agentPromise
+    .then((lateAgent) => bestEffortDisposeAgent(lateAgent, taskId))
+    .catch(() => {
+      // The original timeout has already been recorded on the task.
+    });
+}
+
+function cancelLateRun(runPromise: Promise<RunnerTaskRun>, taskId: string): void {
+  void runPromise
+    .then((lateRun) => bestEffortCancel(lateRun, taskId))
+    .catch(() => {
+      // The original timeout has already been recorded on the task.
+    });
 }
 
 class BoundedTextBuffer {
