@@ -162,11 +162,18 @@ export function AgentKanbanApp() {
     async function restore() {
       const existingSessionId = window.localStorage.getItem(sessionStorageKey)
       try {
-        const restored = await fetchJson<PublicSession>("/api/session", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId: existingSessionId }),
-        })
+        let restored: PublicSession
+        try {
+          restored = await restoreStoredSession(existingSessionId)
+        } catch (restoreError) {
+          if (!existingSessionId) {
+            throw restoreError
+          }
+
+          window.localStorage.removeItem(sessionStorageKey)
+          restored = await restoreStoredSession(null)
+        }
+
         if (cancelled) {
           return
         }
@@ -1240,6 +1247,14 @@ async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
   }
 
   return payload as T
+}
+
+function restoreStoredSession(sessionId: string | null) {
+  return fetchJson<PublicSession>("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(sessionId ? { sessionId } : {}),
+  })
 }
 
 function errorMessage(error: unknown, fallback: string) {
