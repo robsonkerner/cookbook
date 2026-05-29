@@ -154,6 +154,8 @@ export async function restoreSession(sessionId?: string): Promise<PublicSession>
     if (existing) {
       return publicSession(existing)
     }
+
+    throw new UnknownSessionError()
   }
 
   const persistedApiKey = (await readSettings()).cursorApiKey?.trim()
@@ -193,13 +195,7 @@ export async function requireSession(request: Request): Promise<Session> {
     return session
   }
 
-  const restored = await restoreSession(sessionId)
-  const restoredSession = sessions.get(restored.id)
-  if (!restoredSession) {
-    throw new UnknownSessionError()
-  }
-
-  return restoredSession
+  throw new UnknownSessionError()
 }
 
 function getCookie(request: Request, name: string) {
@@ -562,8 +558,12 @@ async function readSettings(): Promise<Settings> {
 }
 
 async function writeSettings(settings: Settings) {
-  await fs.mkdir(settingsDir, { recursive: true })
-  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`)
+  await fs.mkdir(settingsDir, { recursive: true, mode: 0o700 })
+  await fs.chmod(settingsDir, 0o700).catch(() => {})
+  await fs.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, {
+    mode: 0o600,
+  })
+  await fs.chmod(settingsPath, 0o600).catch(() => {})
 }
 
 function normalizeAgent(rawAgent: unknown): AgentCard {

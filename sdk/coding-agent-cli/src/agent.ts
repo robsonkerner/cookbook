@@ -403,7 +403,8 @@ function detectCloudRepository(cwd: string): CloudRepository {
   }
 
   const branch = runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"])
-  const startingRef = branch && branch !== "HEAD" ? branch : undefined
+  const startingRef =
+    branch && branch !== "HEAD" ? branch : runGit(cwd, ["rev-parse", "HEAD"])
 
   return startingRef ? { url, startingRef } : { url }
 }
