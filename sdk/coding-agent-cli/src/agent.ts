@@ -71,6 +71,7 @@ export class CodingAgentSession {
   private agentKey: string
   private cloudRepository: CloudRepository | null = null
   private currentRun: Run | null = null
+  private promptInFlight = false
   private readonly apiKey: string
   private readonly cwd: string
   private readonly force: boolean
@@ -117,11 +118,15 @@ export class CodingAgentSession {
   }
 
   async reset() {
+    if (this.hasActivePrompt()) {
+      throw new Error("Wait for the current run to finish before resetting the agent.")
+    }
+
     await this.replaceAgent()
   }
 
   async setExecutionMode(mode: ExecutionMode) {
-    if (this.currentRun) {
+    if (this.hasActivePrompt()) {
       throw new Error("Wait for the current run to finish before switching execution mode.")
     }
 
@@ -163,16 +168,22 @@ export class CodingAgentSession {
   }
 
   async sendPrompt({ prompt, onEvent }: SendPromptOptions) {
-    await this.ensureAgentFresh()
+    if (this.hasActivePrompt()) {
+      throw new Error("Wait for the current run to finish before sending another prompt.")
+    }
 
-    const run = await this.agent.send(buildPrompt(prompt), {
-      ...(this.mode === "local" ? { model: this.modelSelection } : {}),
-      ...(this.mode === "local" && this.force ? { local: { force: true } } : {}),
-    })
-
-    this.currentRun = run
+    this.promptInFlight = true
+    let run: Run | null = null
 
     try {
+      await this.ensureAgentFresh()
+
+      run = await this.agent.send(buildPrompt(prompt), {
+        ...(this.mode === "local" ? { model: this.modelSelection } : {}),
+        ...(this.mode === "local" && this.force ? { local: { force: true } } : {}),
+      })
+
+      this.currentRun = run
       for await (const event of run.stream()) {
         emitSdkMessage(event, onEvent)
       }
@@ -186,9 +197,10 @@ export class CodingAgentSession {
         usage,
       })
     } finally {
-      if (this.currentRun === run) {
+      if (run && this.currentRun === run) {
         this.currentRun = null
       }
+      this.promptInFlight = false
     }
   }
 
@@ -232,6 +244,10 @@ export class CodingAgentSession {
     this.agent = this.createAgent()
     this.agentKey = this.currentAgentKey()
     await previousAgent[Symbol.asyncDispose]()
+  }
+
+  private hasActivePrompt() {
+    return this.promptInFlight || this.currentRun !== null
   }
 
   private currentAgentKey() {
