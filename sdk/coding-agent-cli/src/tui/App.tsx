@@ -78,6 +78,8 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
   const { width: columns, height: rows } = useTerminalDimensions()
   const sessionRef = useRef<CodingAgentSession | null>(null)
   const nextIdRef = useRef(0)
+  const busyRef = useRef(false)
+  const cancelRequestedRef = useRef(false)
   const [busy, setBusy] = useState(false)
   const [cancelRequested, setCancelRequested] = useState(false)
   const [executionMode, setExecutionModeState] = useState<ExecutionMode>("local")
@@ -115,13 +117,25 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
     renderer.destroy()
   }
 
+  const setBusyState = (value: boolean) => {
+    busyRef.current = value
+    setBusy(value)
+  }
+
+  const setCancelRequestedState = (value: boolean) => {
+    cancelRequestedRef.current = value
+    setCancelRequested(value)
+  }
+
   useKeyboard((key) => {
     const character = getInputCharacter(key)
 
     if (key.ctrl && key.name === "c") {
-      if (busy) {
-        if (!cancelRequested) {
+      if (busyRef.current) {
+        if (!cancelRequestedRef.current) {
           void cancelActiveRun()
+        } else {
+          exitApp()
         }
       } else {
         exitApp()
@@ -241,7 +255,7 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
     const prompt = value.trim()
     setInput("")
 
-    if (!prompt || busy) {
+    if (!prompt || busyRef.current) {
       return
     }
 
@@ -359,11 +373,11 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
 
   const resetAgent = async () => {
     const session = sessionRef.current
-    if (!session || busy) {
+    if (!session || busyRef.current) {
       return
     }
 
-    setBusy(true)
+    setBusyState(true)
 
     try {
       await session.reset()
@@ -372,13 +386,13 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
     } catch (error) {
       addEntry("error", "reset", getErrorMessage(error))
     } finally {
-      setBusy(false)
+      setBusyState(false)
     }
   }
 
   const switchExecutionMode = async (nextMode: ExecutionMode) => {
     const session = sessionRef.current
-    if (!session || busy) {
+    if (!session || busyRef.current) {
       return
     }
 
@@ -387,7 +401,7 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
       return
     }
 
-    setBusy(true)
+    setBusyState(true)
 
     try {
       await session.setExecutionMode(nextMode)
@@ -400,19 +414,19 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
     } catch (error) {
       addEntry("error", "mode", getErrorMessage(error))
     } finally {
-      setBusy(false)
+      setBusyState(false)
     }
   }
 
   const sendPrompt = async (prompt: string) => {
     const session = sessionRef.current
-    if (!session) {
+    if (!session || busyRef.current) {
       return
     }
 
     const assistantId = nextId()
-    setBusy(true)
-    setCancelRequested(false)
+    setBusyState(true)
+    setCancelRequestedState(false)
     setScrollOffset(0)
     setTranscript((items) => [
       ...items,
@@ -429,18 +443,18 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
     } catch (error) {
       addEntry("error", "run", getErrorMessage(error))
     } finally {
-      setBusy(false)
-      setCancelRequested(false)
+      setBusyState(false)
+      setCancelRequestedState(false)
     }
   }
 
   const cancelActiveRun = async () => {
     const session = sessionRef.current
-    if (!session || cancelRequested) {
+    if (!session || cancelRequestedRef.current) {
       return
     }
 
-    setCancelRequested(true)
+    setCancelRequestedState(true)
 
     try {
       const result = await session.cancelCurrentRun()
@@ -448,11 +462,11 @@ export function App({ apiKey, cwd, force, initialModel }: TuiAppProps) {
       if (result.cancelled) {
         addEntry("status", "run", "Cancellation requested.")
       } else {
-        setCancelRequested(false)
+        setCancelRequestedState(false)
         addEntry("error", "cancel", result.reason)
       }
     } catch (error) {
-      setCancelRequested(false)
+      setCancelRequestedState(false)
       addEntry("error", "cancel", getErrorMessage(error))
     }
   }
