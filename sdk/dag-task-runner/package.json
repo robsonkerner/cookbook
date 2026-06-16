@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/run_dag.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "init-canvas": "tsx src/run_dag.ts --init-only --dag examples/example_dag.json --canvas-path \"$PWD/.canvas/dag-example.canvas.tsx\"",
     "example": "tsx src/run_dag.ts --dag examples/example_dag.json --canvas-path \"$PWD/.canvas/dag-example.canvas.tsx\""
   },
