@@ -370,6 +370,7 @@ export async function runTask(
 
   let agent: RunnerTaskAgent | undefined;
   let run: RunnerTaskRun | undefined;
+  let cancelAttempted = false;
   const buffer = new BoundedTextBuffer(STREAM_CAP);
   let lastPublishAt = 0;
   const publishIfDue = (force = false): void => {
@@ -379,6 +380,11 @@ export async function runTask(
     if (text.trim()) ts.resultText = text;
     writer.schedule(structuredCloneState(state));
     lastPublishAt = now;
+  };
+  const cancelRun = async (): Promise<void> => {
+    if (!run || cancelAttempted) return;
+    cancelAttempted = true;
+    await bestEffortCancel(run, task.id, cleanupTimeoutMs);
   };
 
   try {
@@ -488,7 +494,7 @@ export async function runTask(
     }
   } catch (err) {
     if (run && isTimeoutError(err)) {
-      await bestEffortCancel(run, task.id, cleanupTimeoutMs);
+      await cancelRun();
     }
     ts.finishedAt = Date.now();
     ts.durationMs = ts.finishedAt - (ts.startedAt ?? ts.finishedAt);
@@ -498,7 +504,7 @@ export async function runTask(
     if (rendered) ts.resultText = rendered;
   } finally {
     if (run && run.status === "running") {
-      await bestEffortCancel(run, task.id, cleanupTimeoutMs);
+      await cancelRun();
     }
     if (run) {
       activeHandles?.runs.delete(run);
