@@ -641,10 +641,11 @@ async function bestEffortDispose(
   taskId: string,
   timeoutMs = CLEANUP_GRACE_MS,
 ): Promise<void> {
-  if (typeof agent[Symbol.asyncDispose] !== "function") return;
+  const dispose = agent[Symbol.asyncDispose];
+  if (typeof dispose !== "function") return;
   try {
     await withTimeout(
-      Promise.resolve(agent[Symbol.asyncDispose]()),
+      Promise.resolve(dispose.call(agent)),
       timeoutMs,
       `Timed out disposing task ${taskId} agent after ${formatMs(timeoutMs)}`,
     );
