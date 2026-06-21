@@ -67,7 +67,11 @@ Quality bar: when you sketch the rank structure (rank 1 → rank 2 → …), at 
 
 The example shipped with the runner (`examples/example_dag.json`) demonstrates the pattern: rank 1 fans out to two read-only research tasks, rank 2 merges them into a design, rank 3 implements, and rank 4 fans out again to tests + docs.
 
-Write the JSON to a temp file **and immediately generate the initial canvas** so the user can open it while subagents spin up. Run all of the following in a single shell block:
+Write the JSON to a temp file with a file-writing/editing tool, then immediately generate the initial canvas so the user can open it while subagents spin up.
+
+Do **not** embed user/model-derived DAG JSON in an executable shell heredoc (for example, `cat <<'JSON'`). A prompt can contain the delimiter and inject shell commands. Treat the DAG as data: use your environment's file-write tool to create `/tmp/dag-<slug>.json`, then run the shell block below, which only references that already-written path.
+
+After the DAG file exists, run:
 
 ```bash
 # 0. Locate the runner and pick a canvas path
@@ -96,22 +100,17 @@ resolve_runner_dir() {
 RUNNER_DIR="$(resolve_runner_dir)"
 CANVAS_PATH="$HOME/.cursor/projects/<workspace-slug>/canvases/dag-<slug>.canvas.tsx"
 
-# 1. Write the DAG JSON
-cat > /tmp/dag-<slug>.json <<'JSON'
-{ "title": "...", "tasks": [ ... ] }
-JSON
-
-# 2. Ensure deps are installed (skips if already present)
+# 1. Ensure deps are installed (skips if already present)
 [ -x "$RUNNER_DIR/node_modules/.bin/tsx" ] || \
   (cd "$RUNNER_DIR" && (pnpm install --silent || npm install --silent))
 
-# 3. Generate the initial all-PENDING canvas (no CURSOR_API_KEY needed)
+# 2. Generate the initial all-PENDING canvas (no CURSOR_API_KEY needed)
 "$RUNNER_DIR/node_modules/.bin/tsx" "$RUNNER_DIR/run_dag.ts" \
   --init-only \
   --dag /tmp/dag-<slug>.json \
   --canvas-path "$CANVAS_PATH"
 
-# 4. Best-effort auto-open of the canvas file; ignore failure in headless/non-macOS environments
+# 3. Best-effort auto-open of the canvas file; ignore failure in headless/non-macOS environments
 open "$CANVAS_PATH" >/dev/null 2>&1 || true
 ```
 
