@@ -630,7 +630,7 @@ async function bestEffortCancel(
 async function bestEffortDispose(agent: RunnerAgent, taskId: string): Promise<void> {
   try {
     await withTimeout(
-      agent[Symbol.asyncDispose](),
+      Promise.resolve(agent[Symbol.asyncDispose]()),
       CLEANUP_TIMEOUT_MS,
       `Dispose timed out after ${formatMs(CLEANUP_TIMEOUT_MS)}`,
     );
