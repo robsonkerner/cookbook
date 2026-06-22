@@ -43,7 +43,7 @@ Run the included example DAG end-to-end:
 pnpm example
 ```
 
-The example builds a tiny single-file CLI todo app. Tasks run against `process.cwd()` by default, so use a scratch directory if you don't want files written into the cookbook:
+The example builds a tiny single-file CLI todo app under `.canvas/dag-example-workdir` so generated files stay out of the cookbook sources. Custom DAGs run against `process.cwd()` by default, so pass `--cwd` when you want agent file writes isolated:
 
 ```bash
 mkdir -p /tmp/dag-demo && cd /tmp/dag-demo
