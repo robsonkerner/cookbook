@@ -649,7 +649,7 @@ async function bestEffortCancel(
 async function bestEffortDispose(agent: AsyncDisposable, taskId: string): Promise<void> {
   try {
     await withCleanupTimeout(
-      agent[Symbol.asyncDispose](),
+      Promise.resolve(agent[Symbol.asyncDispose]()),
       CLEANUP_GRACE_MS,
       `dispose task ${taskId}`,
     );
