@@ -185,6 +185,7 @@ async function main(): Promise<void> {
   );
 
   const writer = new CanvasWriter(args.canvasPath, args.debounceMs);
+  const activeTasks = new ActiveTaskRegistry();
   let finalized = false;
   let interrupting = false;
 
@@ -229,6 +230,7 @@ async function main(): Promise<void> {
     if (interrupting) return;
     interrupting = true;
     try {
+      await activeTasks.cancelAll(SHUTDOWN_CLEANUP_TIMEOUT_MS);
       await markRunTerminated(state, message, outcome);
       writer.schedule(structuredCloneState(state));
       await writer.flush();
@@ -249,12 +251,14 @@ async function main(): Promise<void> {
 
   try {
     for (let rankIdx = 0; rankIdx < ranks.length; rankIdx++) {
+      if (interrupting) break;
       const rank = ranks[rankIdx];
       console.log(
         `[dag-runner] rank ${rankIdx + 1}/${ranks.length}: ${rank.map((t) => t.id).join(", ")}`,
       );
       await Promise.all(
         rank.map((task) => {
+          if (interrupting) return Promise.resolve();
           const failedDeps = task.depends_on.filter((depId) => {
             const dep = stateById.get(depId);
             return dep !== undefined && dep.status === "ERROR";
@@ -273,11 +277,15 @@ async function main(): Promise<void> {
               taskTimeoutMs: args.taskTimeoutMs,
               streamPublishMs: args.streamPublishMs,
               streamIdleTimeoutMs: args.streamIdleTimeoutMs,
+              activeTasks,
+              isShuttingDown: () => interrupting,
             },
           );
         }),
       );
     }
+
+    if (interrupting) return;
 
     state.finishedAt = Date.now();
     const errors = state.tasks.filter((t) => t.status === "ERROR");
@@ -326,23 +334,20 @@ async function runTask(
   cwd: string,
   options: RunTaskOptions,
 ): Promise<void> {
-  const { taskTimeoutMs, streamPublishMs, streamIdleTimeoutMs } = options;
+  const { taskTimeoutMs, streamPublishMs, streamIdleTimeoutMs, activeTasks, isShuttingDown } = options;
   const ts = stateById.get(task.id)!;
   ts.status = "RUNNING";
   ts.startedAt = Date.now();
   writer.schedule(structuredCloneState(state));
+  const deadline = Date.now() + taskTimeoutMs;
+  const activeTask = activeTasks.register(task.id);
 
   const upstreamContext = buildUpstreamContext(task, stateById);
   const stitched = upstreamContext
     ? `${upstreamContext}\n\n---\n\n${task.subtask_prompt}`
     : task.subtask_prompt;
 
-  const agent = await Agent.create({
-    apiKey: process.env.CURSOR_API_KEY!,
-    model: { id: ts.model },
-    local: { cwd },
-  });
-
+  let agent: CursorAgent | undefined;
   let run: RunnerTaskRun | undefined;
   const buffer = new BoundedTextBuffer(STREAM_CAP);
   let lastPublishAt = 0;
@@ -354,12 +359,34 @@ async function runTask(
     writer.schedule(structuredCloneState(state));
     lastPublishAt = now;
   };
-  const deadline = Date.now() + taskTimeoutMs;
 
   try {
-    run = (await agent.send(stitched)) as RunnerTaskRun;
+    throwIfShuttingDown(isShuttingDown);
+    agent = await withRemainingDeadline(
+      () => Agent.create({
+        apiKey: process.env.CURSOR_API_KEY!,
+        model: { id: ts.model },
+        local: { cwd },
+      }),
+      deadline,
+      taskTimeoutMs,
+      `Task ${task.id} did not create an agent within ${formatMs(taskTimeoutMs)}`,
+    );
+    activeTask.agent = agent;
+    throwIfShuttingDown(isShuttingDown);
+
+    run = (await withRemainingDeadline(
+      () => agent.send(stitched),
+      deadline,
+      taskTimeoutMs,
+      `Task ${task.id} did not start within ${formatMs(taskTimeoutMs)}`,
+    )) as RunnerTaskRun;
+    activeTask.run = run;
+    throwIfShuttingDown(isShuttingDown);
+
     const iterator = run.stream()[Symbol.asyncIterator]();
     while (true) {
+      throwIfShuttingDown(isShuttingDown);
       const timeoutForNext = Math.min(deadline - Date.now(), streamIdleTimeoutMs);
       if (timeoutForNext <= 0) {
         throw new TimeoutError(`Task ${task.id} exceeded deadline of ${formatMs(taskTimeoutMs)}`);
@@ -427,6 +454,7 @@ async function runTask(
     if (!result) {
       throw new Error(`Task ${task.id} completed without a result`);
     }
+    throwIfShuttingDown(isShuttingDown);
 
     ts.finishedAt = Date.now();
     ts.durationMs = result.durationMs ?? ts.finishedAt - (ts.startedAt ?? ts.finishedAt);
@@ -443,7 +471,7 @@ async function runTask(
     }
   } catch (err) {
     if (run && isTimeoutError(err)) {
-      await bestEffortCancel(run, task.id);
+      await bestEffortCancel(run, task.id, "timed-out task");
     }
     ts.finishedAt = Date.now();
     ts.durationMs = ts.finishedAt - (ts.startedAt ?? ts.finishedAt);
@@ -453,15 +481,22 @@ async function runTask(
     if (rendered) ts.resultText = rendered;
   } finally {
     if (run && run.status === "running") {
-      await bestEffortCancel(run, task.id);
+      await bestEffortCancel(
+        run,
+        task.id,
+        isShuttingDown() ? "interrupted task" : "running task",
+      );
     }
-    publishIfDue(true);
-    try {
-      await (agent as unknown as AsyncDisposable)[Symbol.asyncDispose]();
-    } catch {
-      // ignore dispose errors
+    if (!isShuttingDown()) {
+      publishIfDue(true);
     }
-    writer.schedule(structuredCloneState(state));
+    if (agent) {
+      await bestEffortDispose(agent, task.id);
+    }
+    activeTasks.unregister(activeTask);
+    if (!isShuttingDown()) {
+      writer.schedule(structuredCloneState(state));
+    }
   }
 }
 
@@ -469,6 +504,55 @@ interface RunTaskOptions {
   taskTimeoutMs: number;
   streamPublishMs: number;
   streamIdleTimeoutMs: number;
+  activeTasks: ActiveTaskRegistry;
+  isShuttingDown: () => boolean;
+}
+
+type CursorAgent = Awaited<ReturnType<typeof Agent.create>>;
+
+interface ActiveTaskHandle {
+  taskId: string;
+  run?: RunnerTaskRun;
+  agent?: AsyncDisposable;
+}
+
+class ActiveTaskRegistry {
+  private readonly active = new Set<ActiveTaskHandle>();
+
+  register(taskId: string): ActiveTaskHandle {
+    const handle: ActiveTaskHandle = { taskId };
+    this.active.add(handle);
+    return handle;
+  }
+
+  unregister(handle: ActiveTaskHandle): void {
+    this.active.delete(handle);
+  }
+
+  async cancelAll(timeoutMs: number): Promise<void> {
+    const handles = [...this.active];
+    if (handles.length === 0) return;
+    console.error(`[dag-runner] cancelling ${handles.length} active task(s)`);
+    try {
+      await withTimeout(
+        Promise.all(
+          handles.map(async (handle) => {
+            if (handle.run) {
+              await bestEffortCancel(handle.run, handle.taskId, "interrupted task");
+            }
+            if (handle.agent) {
+              await bestEffortDispose(handle.agent, handle.taskId);
+            }
+          }),
+        ).then(() => undefined),
+        timeoutMs,
+        `Timed out cancelling active tasks after ${formatMs(timeoutMs)}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[dag-runner] ${msg}; exiting with remaining cleanup best-effort`);
+    }
+  }
 }
 
 /** Cap on per-task `resultText` size — applies to live streaming and final state. */
@@ -481,6 +565,10 @@ const DEFAULT_STREAM_PUBLISH_MS = 500;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 /** Avoid hanging indefinitely in wait() when stream is already done. */
 const WAIT_AFTER_STREAM_GRACE_MS = 15 * 1000;
+/** Bound interrupt cleanup so signal handling cannot hang indefinitely. */
+const SHUTDOWN_CLEANUP_TIMEOUT_MS = 10 * 1000;
+/** Bound individual SDK cleanup calls during timeout or interruption handling. */
+const TASK_CLEANUP_TIMEOUT_MS = 5 * 1000;
 /** Chars of each parent's output included in the child prompt. */
 const UPSTREAM_SNIPPET_CAP = 2000;
 /** Raised listener ceiling to avoid false-positive AbortSignal warnings from SDK internals. */
@@ -533,16 +621,53 @@ async function withTimeout<T>(
   }
 }
 
+async function withRemainingDeadline<T>(
+  start: () => Promise<T>,
+  deadline: number,
+  originalTimeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    throw new TimeoutError(`Task exceeded deadline of ${formatMs(originalTimeoutMs)}`);
+  }
+  return withTimeout(start(), remainingMs, timeoutMessage);
+}
+
+function throwIfShuttingDown(isShuttingDown: () => boolean): void {
+  if (isShuttingDown()) {
+    throw new Error("Runner interrupted");
+  }
+}
+
 async function bestEffortCancel(
   run: { cancel?: () => Promise<void> | void },
   taskId: string,
+  context: string,
 ): Promise<void> {
   if (typeof run.cancel !== "function") return;
   try {
-    await run.cancel();
+    await withTimeout(
+      Promise.resolve(run.cancel()),
+      TASK_CLEANUP_TIMEOUT_MS,
+      `Timed out cancelling ${context} ${taskId}`,
+    );
   } catch (cancelErr) {
     const msg = cancelErr instanceof Error ? cancelErr.message : String(cancelErr);
-    console.error(`[dag-runner] failed to cancel timed-out task ${taskId}: ${msg}`);
+    console.error(`[dag-runner] failed to cancel ${context} ${taskId}: ${msg}`);
+  }
+}
+
+async function bestEffortDispose(agent: AsyncDisposable, taskId: string): Promise<void> {
+  try {
+    await withTimeout(
+      agent[Symbol.asyncDispose](),
+      TASK_CLEANUP_TIMEOUT_MS,
+      `Timed out disposing agent for task ${taskId}`,
+    );
+  } catch (disposeErr) {
+    const msg = disposeErr instanceof Error ? disposeErr.message : String(disposeErr);
+    console.error(`[dag-runner] failed to dispose agent for task ${taskId}: ${msg}`);
   }
 }
 
