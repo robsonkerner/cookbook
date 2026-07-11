@@ -375,8 +375,9 @@ async function runTask(
     activeTask.agent = agent;
     throwIfShuttingDown(isShuttingDown);
 
+    const createdAgent = agent;
     run = (await withRemainingDeadline(
-      () => agent.send(stitched),
+      () => createdAgent.send(stitched),
       deadline,
       taskTimeoutMs,
       `Task ${task.id} did not start within ${formatMs(taskTimeoutMs)}`,
@@ -661,7 +662,7 @@ async function bestEffortCancel(
 async function bestEffortDispose(agent: AsyncDisposable, taskId: string): Promise<void> {
   try {
     await withTimeout(
-      agent[Symbol.asyncDispose](),
+      Promise.resolve(agent[Symbol.asyncDispose]()),
       TASK_CLEANUP_TIMEOUT_MS,
       `Timed out disposing agent for task ${taskId}`,
     );
