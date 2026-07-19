@@ -37,8 +37,12 @@ type TuiInputProps = {
   onSubmit: (value: string) => void
 }
 
-function TuiInput(props: TuiInputProps) {
-  return createElement("tui-input", props)
+export function TuiInput(props: TuiInputProps) {
+  return createElement("tui-input", {
+    ...props,
+    id: "prompt-input",
+    maxLength: Number.MAX_SAFE_INTEGER,
+  })
 }
 
 type TuiAppProps = {
