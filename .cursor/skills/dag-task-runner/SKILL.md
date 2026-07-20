@@ -137,7 +137,10 @@ Always use the link text `Open Canvas`. Use the absolute path in both the `file:
 Ensure `CURSOR_API_KEY` is set (the runner fails fast if missing), then launch:
 
 ```bash
-[ -n "$CURSOR_API_KEY" ] || { [ -f .env ] && set -a && source .env && set +a; }
+[ -n "${CURSOR_API_KEY:-}" ] || {
+  echo "CURSOR_API_KEY is not set. Export it before running the DAG." >&2
+  exit 1
+}
 
 "$RUNNER_DIR/node_modules/.bin/tsx" "$RUNNER_DIR/run_dag.ts" \
   --dag /tmp/dag-<slug>.json \
@@ -185,11 +188,9 @@ The runner reads `CURSOR_API_KEY` from the environment. Set it however you usual
 export CURSOR_API_KEY=crsr_...
 ```
 
-If the current workspace has a `.env` containing it, source that first:
-
-```bash
-set -a && source .env && set +a
-```
+Do not `source` a workspace `.env`: dotenv files are data, but a shell evaluates
+command substitutions and other executable syntax in them. Load the key through
+a trusted secret manager or export only the verified `CURSOR_API_KEY` value.
 
 ## CLI options
 
