@@ -157,7 +157,7 @@ async function main(): Promise<void> {
 
   if (!args.initOnly && !process.env.CURSOR_API_KEY) {
     throw new Error(
-      "CURSOR_API_KEY is not set. Export it or `set -a && source .env && set +a` first.",
+      "CURSOR_API_KEY is not set. Export it before running the DAG.",
     );
   }
 
