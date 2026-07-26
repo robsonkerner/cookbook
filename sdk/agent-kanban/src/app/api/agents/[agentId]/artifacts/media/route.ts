@@ -1,3 +1,4 @@
+import { artifactMediaResponseHeaders } from "@/lib/agents/artifact-media"
 import { jsonError } from "@/lib/agents/http"
 import { readArtifactContent, requireSession } from "@/lib/agents/server"
 
@@ -34,10 +35,10 @@ export async function GET(
     })
 
     return new Response(stream, {
-      headers: {
-        "Cache-Control": "private, max-age=300",
-        "Content-Type": artifact.contentType,
-      },
+      headers: artifactMediaResponseHeaders(
+        artifactPath,
+        artifact.contentType
+      ),
     })
   } catch (error) {
     return jsonError(error, "Failed to stream artifact media.")
