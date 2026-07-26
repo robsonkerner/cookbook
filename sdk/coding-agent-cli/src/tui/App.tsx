@@ -26,6 +26,7 @@ import {
   type SlashCommandName,
 } from "../commands.js"
 import type { ModelSelection } from "@cursor/sdk"
+import { wrapText } from "./wrap-text.js"
 
 extend({ "tui-input": InputRenderable })
 
@@ -741,10 +742,24 @@ function renderMarkdownLines(value: string, width: number) {
     const ordered = line.match(/^\s*(\d+)[.)]\s+(.+)$/)
     if (ordered) {
       const marker = `${ordered[1]}. `
-      for (const [index, text] of wrapText(ordered[2] ?? "", width - marker.length).entries()) {
+      // Oversized markers would make wrap width <= 0; render as plain text.
+      if (marker.length >= width) {
+        for (const text of wrapText(line, width)) {
+          lines.push({ parts: parseInlineMarkdown(text) })
+        }
+        continue
+      }
+
+      for (const [index, text] of wrapText(
+        ordered[2] ?? "",
+        width - marker.length
+      ).entries()) {
         lines.push({
           parts: [
-            { text: index === 0 ? marker : " ".repeat(marker.length), color: "cyan" },
+            {
+              text: index === 0 ? marker : " ".repeat(marker.length),
+              color: "cyan",
+            },
             ...parseInlineMarkdown(text),
           ],
         })
@@ -760,32 +775,6 @@ function renderMarkdownLines(value: string, width: number) {
   return lines
 }
 
-function wrapText(value: string, width: number) {
-  const lines: string[] = []
-
-  for (const rawLine of value.split("\n")) {
-    let line = rawLine
-
-    if (!line) {
-      lines.push("")
-      continue
-    }
-
-    while (line.length > width) {
-      let breakAt = line.lastIndexOf(" ", width)
-      if (breakAt < width * 0.5) {
-        breakAt = width
-      }
-
-      lines.push(line.slice(0, breakAt).trimEnd())
-      line = line.slice(breakAt).trimStart()
-    }
-
-    lines.push(line)
-  }
-
-  return lines
-}
 
 function parseInlineMarkdown(value: string): TranscriptPart[] {
   const parts: TranscriptPart[] = []
