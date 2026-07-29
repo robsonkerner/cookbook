@@ -5,6 +5,14 @@ import path from "node:path"
 
 import { Agent, Cursor } from "@cursor/sdk"
 
+import {
+  getLiveSession,
+  getRepositoryCache,
+  putLiveSession,
+  revokeAllLiveSessions,
+  setRepositoryCache,
+  type LiveSession,
+} from "./session-store"
 import type {
   AgentCard,
   AgentListResponse,
@@ -21,11 +29,7 @@ type Settings = {
   cursorApiKey?: string
 }
 
-type Session = {
-  id: string
-  apiKey: string
-  user: PublicUser | null
-}
+type Session = LiveSession
 
 type UnknownRecord = Record<string, unknown>
 
@@ -51,12 +55,6 @@ type CursorNamespace = typeof Cursor & {
   }
 }
 
-type RepositoryCacheEntry = {
-  loadedAt: number
-  repositories: RepositoryOption[]
-  rawById: Map<string, unknown>
-}
-
 type RunSummary = {
   id?: string
   status?: string
@@ -71,20 +69,6 @@ type RunSummary = {
 const settingsDir = path.join(os.homedir(), ".agent-kanban")
 const settingsPath = path.join(settingsDir, "settings.json")
 const repositoryCacheTtlMs = 55_000
-
-const globalForAgentKanban = globalThis as typeof globalThis & {
-  __agentKanbanSessions?: Map<string, Session>
-  __agentKanbanRepositoryCache?: Map<string, RepositoryCacheEntry>
-}
-
-const sessions =
-  globalForAgentKanban.__agentKanbanSessions ?? new Map<string, Session>()
-globalForAgentKanban.__agentKanbanSessions = sessions
-
-const repositoryCache =
-  globalForAgentKanban.__agentKanbanRepositoryCache ??
-  new Map<string, RepositoryCacheEntry>()
-globalForAgentKanban.__agentKanbanRepositoryCache = repositoryCache
 
 const agentSdk = Agent as unknown as AgentNamespace
 const cursorSdk = Cursor as CursorNamespace
@@ -140,7 +124,7 @@ export async function createSession(
     apiKey: trimmedKey,
     user: await getCurrentUser(trimmedKey),
   }
-  sessions.set(session.id, session)
+  putLiveSession(session)
 
   return {
     ...publicSession(session),
@@ -150,7 +134,7 @@ export async function createSession(
 
 export async function restoreSession(sessionId?: string): Promise<PublicSession> {
   if (sessionId) {
-    const existing = sessions.get(sessionId)
+    const existing = getLiveSession(sessionId)
     if (existing) {
       return publicSession(existing)
     }
@@ -168,7 +152,7 @@ export async function restoreSession(sessionId?: string): Promise<PublicSession>
     apiKey: persistedApiKey,
     user: await getCurrentUser(persistedApiKey),
   }
-  sessions.set(session.id, session)
+  putLiveSession(session)
 
   return {
     ...publicSession(session),
@@ -178,6 +162,9 @@ export async function restoreSession(sessionId?: string): Promise<PublicSession>
 
 export async function clearPersistedKey() {
   await writeSettings({})
+  // Forget must revoke live sessions, not only the settings file. Otherwise a
+  // second tab (or a captured session id) keeps full API access until restart.
+  revokeAllLiveSessions()
 }
 
 export async function requireSession(request: Request): Promise<Session> {
@@ -188,13 +175,13 @@ export async function requireSession(request: Request): Promise<Session> {
     throw new MissingCursorApiKeyError()
   }
 
-  const session = sessions.get(sessionId)
+  const session = getLiveSession(sessionId)
   if (session) {
     return session
   }
 
   const restored = await restoreSession(sessionId)
-  const restoredSession = sessions.get(restored.id)
+  const restoredSession = getLiveSession(restored.id)
   if (!restoredSession) {
     throw new UnknownSessionError()
   }
@@ -315,7 +302,7 @@ export async function listModels(apiKey: string): Promise<ModelOption[]> {
 export async function listRepositories(
   apiKey: string
 ): Promise<RepositoryOption[]> {
-  const cache = repositoryCache.get(apiKey)
+  const cache = getRepositoryCache(apiKey)
   if (cache && Date.now() - cache.loadedAt < repositoryCacheTtlMs) {
     return cache.repositories
   }
@@ -341,7 +328,7 @@ export async function listRepositories(
     rawById.set(repository.url, repository)
   }
 
-  repositoryCache.set(apiKey, {
+  setRepositoryCache(apiKey, {
     loadedAt: Date.now(),
     repositories,
     rawById,
