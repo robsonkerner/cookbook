@@ -63,6 +63,10 @@ import {
 } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
+import {
+  isUnknownSessionCode,
+  resolveSessionIdAfterRequestError,
+} from "@/lib/app-builder/session-recovery"
 import { cn } from "@/lib/utils"
 
 type Session = {
@@ -342,7 +346,7 @@ export function AppBuilder() {
       }))
 
       try {
-        const data = await requestSession(
+        const { session: data } = await requestSessionRecoveringStaleId(
           validSavedApiKey,
           restoredSessionId,
           { persistApiKey: hasValidSavedApiKey }
@@ -377,6 +381,15 @@ export function AppBuilder() {
             sessionError: null,
           }))
           return
+        }
+
+        // Drop a stale session so the Retry UI (gated on !session) can appear.
+        if (shouldClearStaleSession(error) && restoredSessionId) {
+          updateConversation(conversation.id, (current) => ({
+            ...current,
+            session: null,
+            updatedAt: Date.now(),
+          }))
         }
 
         const message =
@@ -750,9 +763,13 @@ export function AppBuilder() {
     }))
 
     try {
-      const data = await requestSession(trimmedApiKey, restoredSessionId, {
-        persistApiKey: options.persist,
-      })
+      const { session: data } = await requestSessionRecoveringStaleId(
+        trimmedApiKey,
+        restoredSessionId,
+        {
+          persistApiKey: options.persist,
+        }
+      )
 
       restoredConversationIdsRef.current.add(conversationId)
       applySession(conversationId, data)
@@ -776,6 +793,14 @@ export function AppBuilder() {
       }
       return true
     } catch (error) {
+      if (shouldClearStaleSession(error) && restoredSessionId) {
+        updateConversation(conversationId, (current) => ({
+          ...current,
+          session: null,
+          updatedAt: Date.now(),
+        }))
+      }
+
       const message =
         error instanceof Error ? error.message : "Could not start preview."
       const shouldOpenOnboarding = options.openOnboardingOnError ?? true
@@ -887,9 +912,13 @@ export function AppBuilder() {
     }))
 
     try {
-      const data = await requestSession(validSavedApiKey, restoredSessionId, {
-        persistApiKey: Boolean(validSavedApiKey),
-      })
+      const { session: data } = await requestSessionRecoveringStaleId(
+        validSavedApiKey,
+        restoredSessionId,
+        {
+          persistApiKey: Boolean(validSavedApiKey),
+        }
+      )
       restoredConversationIdsRef.current.add(conversationId)
       applySession(conversationId, data)
       setHasSavedApiKey(true)
@@ -900,6 +929,14 @@ export function AppBuilder() {
         sessionError: null,
       }))
     } catch (error) {
+      if (shouldClearStaleSession(error) && restoredSessionId) {
+        updateConversation(conversationId, (current) => ({
+          ...current,
+          session: null,
+          updatedAt: Date.now(),
+        }))
+      }
+
       if (isMissingApiKeyError(error)) {
         setHasSavedApiKey(false)
         setIsOnboardingOpen(true)
@@ -3854,7 +3891,8 @@ function parseModelSelectionValue(value: string): {
 class SessionRequestError extends Error {
   constructor(
     message: string,
-    readonly code?: string
+    readonly code?: string,
+    readonly discardedStaleSession = false
   ) {
     super(message)
   }
@@ -3862,6 +3900,19 @@ class SessionRequestError extends Error {
 
 function isMissingApiKeyError(error: unknown) {
   return error instanceof SessionRequestError && error.code === "missing_api_key"
+}
+
+function isUnknownSessionError(error: unknown) {
+  return (
+    error instanceof SessionRequestError && isUnknownSessionCode(error.code)
+  )
+}
+
+function shouldClearStaleSession(error: unknown) {
+  return (
+    isUnknownSessionError(error) ||
+    (error instanceof SessionRequestError && error.discardedStaleSession)
+  )
 }
 
 async function requestSession(
@@ -3891,6 +3942,56 @@ async function requestSession(
   }
 
   return data as Session
+}
+
+/**
+ * Restores a session when possible. If the server no longer knows the id
+ * (e.g. after a process restart with no on-disk project, or a deleted
+ * workspace), drops the stale id and creates a fresh session so the UI can
+ * recover instead of looping on the dead id.
+ */
+async function requestSessionRecoveringStaleId(
+  apiKey: string | undefined,
+  sessionId: string | undefined,
+  options?: { persistApiKey?: boolean }
+): Promise<{ session: Session; discardedStaleSession: boolean }> {
+  try {
+    const session = await requestSession(apiKey, sessionId, options)
+    return { session, discardedStaleSession: false }
+  } catch (error) {
+    const errorCode =
+      error instanceof SessionRequestError ? error.code : undefined
+    const recovery = resolveSessionIdAfterRequestError(sessionId, errorCode)
+
+    if (!recovery.clearPersistedSession) {
+      throw error
+    }
+
+    try {
+      const session = await requestSession(
+        apiKey,
+        recovery.nextSessionId,
+        options
+      )
+      return { session, discardedStaleSession: true }
+    } catch (retryError) {
+      if (retryError instanceof SessionRequestError) {
+        throw new SessionRequestError(
+          retryError.message,
+          retryError.code,
+          true
+        )
+      }
+
+      throw new SessionRequestError(
+        retryError instanceof Error
+          ? retryError.message
+          : "Failed to create a session.",
+        undefined,
+        true
+      )
+    }
+  }
 }
 
 function getConversationById(

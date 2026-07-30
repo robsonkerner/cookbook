@@ -15,6 +15,10 @@ import {
   type SDKModel,
 } from "@cursor/sdk"
 
+import {
+  getSessionPackageJsonPath,
+  getSessionProjectPath,
+} from "./session-recovery"
 import { generatedAppFiles } from "./template"
 
 type BuilderSession = {
@@ -238,13 +242,18 @@ export async function restoreSession(
   sessionId: string,
   apiKey: string
 ): Promise<PublicSession> {
-  const session = sessions.get(sessionId)
+  let session = sessions.get(sessionId)
 
   if (!session) {
-    throw new UnknownAppBuilderSessionError()
-  }
+    // Process restarts wipe the in-memory Map, but project files under
+    // ~/.app-builder/sessions/<id>/app survive. Reattach instead of 404ing —
+    // otherwise the client keeps a dead session id and the UI bricks.
+    if (!(await hasRehydratableSessionProject(sessionId))) {
+      throw new UnknownAppBuilderSessionError()
+    }
 
-  if (apiKey !== session.apiKey) {
+    session = await beginRehydratedSession(sessionId, apiKey)
+  } else if (apiKey !== session.apiKey) {
     await updateSessionApiKey(session, apiKey)
   } else if (!session.user) {
     session.user = await getCurrentUser(apiKey)
@@ -855,6 +864,72 @@ function normalizeModelToken(value: string) {
 async function prepareSession(session: BuilderSession) {
   await fs.mkdir(session.projectPath, { recursive: true })
   await writeGeneratedApp(session.projectPath)
+  await runCommand("pnpm", ["install"], session)
+  await startDevServer(session)
+}
+
+async function hasRehydratableSessionProject(sessionId: string) {
+  try {
+    await fs.access(getSessionPackageJsonPath(workspaceRoot, sessionId))
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function beginRehydratedSession(
+  sessionId: string,
+  apiKey: string
+): Promise<BuilderSession> {
+  const existing = sessions.get(sessionId)
+  if (existing) {
+    return existing
+  }
+
+  const port = await getAvailablePort()
+  const raced = sessions.get(sessionId)
+  if (raced) {
+    return raced
+  }
+
+  const projectPath = getSessionProjectPath(workspaceRoot, sessionId)
+  const modelsPromise = listModels(apiKey)
+  const userPromise = getCurrentUser(apiKey)
+  const session: BuilderSession = {
+    id: sessionId,
+    apiKey,
+    models: fallbackModels,
+    user: null,
+    projectPath,
+    port,
+    previewUrl: `http://127.0.0.1:${port}`,
+    logs: [],
+    ready: Promise.resolve(),
+  }
+
+  sessions.set(sessionId, session)
+  const readyPromise = resumeExistingProject(session).catch((error: unknown) => {
+    const message = getErrorMessage(error)
+    session.setupError = message
+    session.logs.push(`[setup] ${message}`)
+    throw error
+  })
+  session.ready = readyPromise
+
+  const [models, user] = await Promise.all([
+    modelsPromise,
+    userPromise,
+    readyPromise,
+  ])
+  session.models = models
+  session.user = user
+
+  return session
+}
+
+async function resumeExistingProject(session: BuilderSession) {
+  // Preserve on-disk edits from before the process restart — do not rewrite
+  // the generated template over the user's workspace.
   await runCommand("pnpm", ["install"], session)
   await startDevServer(session)
 }
