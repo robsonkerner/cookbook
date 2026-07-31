@@ -1016,17 +1016,19 @@ function getAvailablePort(): Promise<number> {
 async function getOrCreateAgent(session: BuilderSession) {
   assertSessionReady(session)
 
-  const agent = await getOrCreateSharedResource(session.agentResource, () =>
-    Agent.create({
-      apiKey: session.apiKey,
-      model: { id: process.env.CURSOR_MODEL ?? "composer-2" },
-      local: {
-        cwd: session.projectPath,
-        envVars: {
-          BROWSER: "none",
+  const agent = await getOrCreateSharedResource(
+    session.agentResource,
+    async () =>
+      await Agent.create({
+        apiKey: session.apiKey,
+        model: { id: process.env.CURSOR_MODEL ?? "composer-2" },
+        local: {
+          cwd: session.projectPath,
+          envVars: {
+            BROWSER: "none",
+          },
         },
-      },
-    })
+      })
   )
   session.agent = agent
   return agent
