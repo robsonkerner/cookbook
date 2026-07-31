@@ -15,6 +15,14 @@ import {
   type SDKModel,
 } from "@cursor/sdk"
 
+import {
+  acquireRunGate,
+  clearSharedResource,
+  getOrCreateSharedResource,
+  releaseRunGate,
+  type RunGateState,
+  type SharedResourceState,
+} from "./agent-session-guard"
 import { generatedAppFiles } from "./template"
 
 type BuilderSession = {
@@ -29,6 +37,8 @@ type BuilderSession = {
   ready: Promise<void>
   devProcess?: ChildProcessWithoutNullStreams
   agent?: SDKAgent
+  agentResource: SharedResourceState<SDKAgent>
+  runGate: RunGateState
   setupError?: string
 }
 
@@ -213,6 +223,8 @@ export async function createSession(apiKey: string): Promise<PublicSession> {
     previewUrl: `http://127.0.0.1:${port}`,
     logs: [],
     ready: Promise.resolve(),
+    agentResource: {},
+    runGate: {},
   }
 
   sessions.set(id, session)
@@ -272,20 +284,28 @@ export async function streamAgentResponse(
   await session.ready
   assertSessionReady(session)
 
-  const agent = await getOrCreateAgent(session)
-  const modelSelection = model
-    ? encodeLocalSdkModelSelection(parseModelSelection(model), session.models)
-    : undefined
-  const run = await agent.send(
-    buildPrompt(userMessage, session),
-    modelSelection ? { model: modelSelection } : undefined
-  )
+  // Claim the session before any await so concurrent chats cannot attach a
+  // second agent or interleave writes into the same project directory.
+  acquireRunGate(session.runGate)
 
-  for await (const event of run.stream()) {
-    emitSdkMessage(event, emit)
+  try {
+    const agent = await getOrCreateAgent(session)
+    const modelSelection = model
+      ? encodeLocalSdkModelSelection(parseModelSelection(model), session.models)
+      : undefined
+    const run = await agent.send(
+      buildPrompt(userMessage, session),
+      modelSelection ? { model: modelSelection } : undefined
+    )
+
+    for await (const event of run.stream()) {
+      emitSdkMessage(event, emit)
+    }
+
+    await run.wait()
+  } finally {
+    releaseRunGate(session.runGate)
   }
-
-  await run.wait()
 }
 
 export async function generateProjectName(
@@ -548,6 +568,7 @@ function toPublicSession(session: BuilderSession): PublicSession {
 async function updateSessionApiKey(session: BuilderSession, apiKey: string) {
   session.apiKey = apiKey
   session.agent = undefined
+  clearSharedResource(session.agentResource)
 
   const [models, user] = await Promise.all([
     listModels(apiKey),
@@ -995,22 +1016,22 @@ function getAvailablePort(): Promise<number> {
 async function getOrCreateAgent(session: BuilderSession) {
   assertSessionReady(session)
 
-  if (session.agent) {
-    return session.agent
-  }
-
-  session.agent = await Agent.create({
-    apiKey: session.apiKey,
-    model: { id: process.env.CURSOR_MODEL ?? "composer-2" },
-    local: {
-      cwd: session.projectPath,
-      envVars: {
-        BROWSER: "none",
-      },
-    },
-  })
-
-  return session.agent
+  const agent = await getOrCreateSharedResource(
+    session.agentResource,
+    async () =>
+      await Agent.create({
+        apiKey: session.apiKey,
+        model: { id: process.env.CURSOR_MODEL ?? "composer-2" },
+        local: {
+          cwd: session.projectPath,
+          envVars: {
+            BROWSER: "none",
+          },
+        },
+      })
+  )
+  session.agent = agent
+  return agent
 }
 
 function assertSessionReady(session: BuilderSession) {
