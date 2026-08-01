@@ -15,6 +15,11 @@ import {
   type SDKModel,
 } from "@cursor/sdk"
 
+import {
+  ensureDevServerRunning,
+  isDevProcessAlive,
+  type EnsureDevServerState,
+} from "./preview-dev-server"
 import { generatedAppFiles } from "./template"
 
 type BuilderSession = {
@@ -28,6 +33,7 @@ type BuilderSession = {
   logs: string[]
   ready: Promise<void>
   devProcess?: ChildProcessWithoutNullStreams
+  devEnsure?: EnsureDevServerState
   agent?: SDKAgent
   setupError?: string
 }
@@ -252,6 +258,7 @@ export async function restoreSession(
 
   await session.ready
   assertSessionReady(session)
+  await ensureDevServer(session)
   return toPublicSession(session)
 }
 
@@ -259,6 +266,7 @@ export async function getPublicSession(id: string): Promise<PublicSession> {
   const session = getSession(id)
   await session.ready
   assertSessionReady(session)
+  await ensureDevServer(session)
   return toPublicSession(session)
 }
 
@@ -271,6 +279,7 @@ export async function streamAgentResponse(
   const session = getSession(sessionId)
   await session.ready
   assertSessionReady(session)
+  await ensureDevServer(session)
 
   const agent = await getOrCreateAgent(session)
   const modelSelection = model
@@ -869,8 +878,35 @@ async function writeGeneratedApp(projectPath: string) {
   )
 }
 
+async function ensureDevServer(session: BuilderSession) {
+  if (!session.devEnsure) {
+    session.devEnsure = {}
+  }
+
+  await ensureDevServerRunning(session.devEnsure, {
+    isAlive: () => isDevProcessAlive(session.devProcess),
+    start: async () => {
+      try {
+        await startDevServer(session)
+      } catch (error) {
+        // Same-port restart can fail if something else still owns the port.
+        // Move the preview and surface the new URL on the next session payload.
+        const previousPort = session.port
+        session.port = await getAvailablePort()
+        session.previewUrl = `http://127.0.0.1:${session.port}`
+        session.logs.push(
+          `[vite] restart on port ${previousPort} failed (${getErrorMessage(
+            error
+          )}); retrying on ${session.port}`
+        )
+        await startDevServer(session)
+      }
+    },
+  })
+}
+
 async function startDevServer(session: BuilderSession) {
-  if (session.devProcess && !session.devProcess.killed) {
+  if (isDevProcessAlive(session.devProcess)) {
     return
   }
 
@@ -897,10 +933,20 @@ async function startDevServer(session: BuilderSession) {
 
   child.once("exit", (code) => {
     session.logs.push(`vite exited with code ${code ?? "unknown"}`)
-    session.devProcess = undefined
+    if (session.devProcess === child) {
+      session.devProcess = undefined
+    }
   })
 
-  await waitForPort(session.port)
+  try {
+    await waitForPort(session.port)
+  } catch (error) {
+    if (session.devProcess === child) {
+      session.devProcess = undefined
+    }
+    child.kill("SIGTERM")
+    throw error
+  }
 }
 
 function runCommand(
