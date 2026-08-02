@@ -10,7 +10,7 @@ Decompose a task into a JSON DAG, run each node as a Cursor SDK local subagent i
 
 - **Authors a DAG** of subtasks with explicit `depends_on` edges and per-task `complexity` (HIGH / MED / LOW), which the runner maps to Cursor models via configurable defaults.
 - **Topo-sorts** the DAG into ranks (Kahn's algorithm) and runs each rank concurrently with `Promise.all`, so independent work fans out automatically.
-- **Stitches upstream output** into each child's prompt — children get a 2,000-char snippet of every parent's result without you re-describing it.
+- **Stitches upstream output** into each child's prompt — children get a 2,000-char **tail** snippet of every parent's result without you re-describing it.
 - **Streams live** to a `.canvas.tsx` file. Cursor recompiles the canvas on every write, so you see token-by-token output land in each task card.
 - **Fails safe**: timeouts mark a task `ERROR` instead of hanging, downstream dependents auto-skip, and SIGINT/SIGTERM cancel in-flight subagents and finalize the canvas before exit.
 
@@ -198,5 +198,5 @@ sdk/dag-task-runner/
 
 - The runner uses the local Cursor SDK runtime — every subagent runs against `--cwd` (defaults to wherever you invoke the runner).
 - Sibling tasks in the same rank run in parallel; do not let them write the same files.
-- Per-task streamed text is capped at 4,000 chars and upstream context passed to children is capped at 2,000 chars per parent, to keep the canvas file modest.
+- Per-task streamed text is capped at 4,000 chars and upstream context passed to children is capped at 2,000 chars per parent (tail retained), to keep the canvas file modest.
 - For a deeper API tour, see the [Cursor SDK TypeScript docs](https://cursor.com/docs/api/sdk/typescript) and the sibling [Quickstart](../quickstart) example.

@@ -213,7 +213,7 @@ set -a && source .env && set +a
 - Sibling tasks in the same rank run in parallel; do not let them write the same files.
 - Inline MCP servers and sub-sub-agents are not configured by this runner.
 - A failed task automatically skips all downstream dependents (they are marked `ERROR` with a "Skipped: upstream task(s) … failed" message). This prevents wasted API calls on tasks whose inputs are missing.
-- Per-task streamed text is capped at `STREAM_CAP = 4000` chars to keep the canvas file modest. Upstream context passed to child tasks is capped at 2000 chars per parent.
+- Per-task streamed text is capped at `STREAM_CAP = 4000` chars to keep the canvas file modest. Upstream context passed to child tasks is capped at 2000 chars per parent (the **tail** is kept so ending conclusions and contracts survive).
 - Timed-out tasks are marked `ERROR` instead of staying indefinitely in `RUNNING`.
 - SIGINT/SIGTERM/SIGHUP gracefully cancel all in-flight subagents and finalize the canvas before exiting.
 - Unexpected unhandled rejections from SDK internals are suppressed to prevent runner crashes; uncaught exceptions are logged and trigger a clean shutdown.

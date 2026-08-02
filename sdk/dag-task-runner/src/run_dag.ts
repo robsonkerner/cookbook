@@ -38,6 +38,10 @@ import {
   type RunState,
   type TaskState,
 } from "./canvas_writer.js";
+import {
+  UPSTREAM_SNIPPET_CAP,
+  truncateUpstreamSnippet,
+} from "./upstream_context.js";
 
 interface CliArgs {
   dag: string;
@@ -481,8 +485,6 @@ const DEFAULT_STREAM_PUBLISH_MS = 500;
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 /** Avoid hanging indefinitely in wait() when stream is already done. */
 const WAIT_AFTER_STREAM_GRACE_MS = 15 * 1000;
-/** Chars of each parent's output included in the child prompt. */
-const UPSTREAM_SNIPPET_CAP = 2000;
 /** Raised listener ceiling to avoid false-positive AbortSignal warnings from SDK internals. */
 const ABORT_SIGNAL_LISTENER_LIMIT = 100;
 
@@ -617,7 +619,7 @@ function buildUpstreamContext(
     if (!dep) continue;
     const status = dep.status;
     const snippet = dep.resultText
-      ? truncate(dep.resultText, UPSTREAM_SNIPPET_CAP)
+      ? truncateUpstreamSnippet(dep.resultText, UPSTREAM_SNIPPET_CAP)
       : dep.errorMessage
         ? `(failed: ${dep.errorMessage})`
         : "(no output)";
@@ -626,11 +628,6 @@ function buildUpstreamContext(
     lines.push("");
   }
   return lines.join("\n");
-}
-
-function truncate(s: string, n: number): string {
-  if (s.length <= n) return s;
-  return s.slice(0, n - 1) + "…";
 }
 
 function formatMs(ms: number): string {
