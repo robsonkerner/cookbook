@@ -157,9 +157,11 @@ The copied skill contains `SKILL.md`, `examples/`, and a `scripts/` runtime dire
 The skill auto-detects the runner in this order:
 
 1. `DAG_RUNNER_DIR`, if set.
-2. `<current-working-directory>/.cursor/skills/dag-task-runner/scripts`.
-3. `<git-root>/.cursor/skills/dag-task-runner/scripts`.
-4. `~/.cursor/skills/dag-task-runner/scripts`.
+2. `~/.cursor/skills/dag-task-runner/scripts` (personal install — preferred over any workspace copy).
+3. `<current-working-directory>/.cursor/skills/dag-task-runner/scripts`.
+4. `<git-root>/.cursor/skills/dag-task-runner/scripts`.
+
+Personal installs win over workspace copies so an untrusted repository cannot shadow a trusted personal skill with a malicious runner. Set `DAG_RUNNER_DIR` to force a project-local runner when both exist.
 
 ## Sync the copyable artifact
 

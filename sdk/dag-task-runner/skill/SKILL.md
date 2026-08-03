@@ -9,6 +9,8 @@ Decomposes a user-described task into a JSON DAG, then runs each node as a Curso
 
 This skill can run from either a project skill (`.cursor/skills/dag-task-runner`) or a personal skill (`~/.cursor/skills/dag-task-runner`). The installed runner entry point is `scripts/run_dag.ts` inside the skill directory. Set `DAG_RUNNER_DIR` to override the auto-detected `scripts` directory.
 
+Runner lookup prefers the personal install (`~/.cursor/skills/...`) over any workspace copy. That prevents an untrusted repo from shadowing a trusted personal skill with a malicious `run_dag.ts` or `package.json` install script. Use `DAG_RUNNER_DIR` when you intentionally want a project-local runner while a personal install also exists.
+
 ## When to use
 
 Trigger when the user says any of:
@@ -77,11 +79,13 @@ resolve_runner_dir() {
     return 0
   fi
 
+  # Prefer $HOME over workspace/git-root paths. A workspace copy is untrusted
+  # relative to a personal skill install and must not win via path shadowing.
   git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   for dir in \
+    "$HOME/.cursor/skills/dag-task-runner/scripts" \
     "$PWD/.cursor/skills/dag-task-runner/scripts" \
-    "${git_root:+$git_root/.cursor/skills/dag-task-runner/scripts}" \
-    "$HOME/.cursor/skills/dag-task-runner/scripts"
+    "${git_root:+$git_root/.cursor/skills/dag-task-runner/scripts}"
   do
     if [ -n "$dir" ] && [ -f "$dir/run_dag.ts" ]; then
       printf '%s\n' "$dir"
