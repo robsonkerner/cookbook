@@ -1,7 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { randomUUID } from "node:crypto"
 import { promises as fs } from "node:fs"
-import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 
@@ -15,6 +14,12 @@ import {
   type SDKModel,
 } from "@cursor/sdk"
 
+import {
+  isPreviewProcessAlive,
+  reservePreviewPort,
+  waitForPreviewPort,
+  type PortReservation,
+} from "./preview-port"
 import { generatedAppFiles } from "./template"
 
 type BuilderSession = {
@@ -27,6 +32,7 @@ type BuilderSession = {
   port: number
   logs: string[]
   ready: Promise<void>
+  portReservation?: PortReservation
   devProcess?: ChildProcessWithoutNullStreams
   agent?: SDKAgent
   setupError?: string
@@ -200,7 +206,7 @@ export async function clearPersistedCursorApiKey() {
 export async function createSession(apiKey: string): Promise<PublicSession> {
   const id = randomUUID()
   const projectPath = path.join(workspaceRoot, id, "app")
-  const port = await getAvailablePort()
+  const portReservation = await reservePreviewPort()
   const modelsPromise = listModels(apiKey)
   const userPromise = getCurrentUser(apiKey)
   const session: BuilderSession = {
@@ -209,10 +215,11 @@ export async function createSession(apiKey: string): Promise<PublicSession> {
     models: fallbackModels,
     user: null,
     projectPath,
-    port,
-    previewUrl: `http://127.0.0.1:${port}`,
+    port: portReservation.port,
+    previewUrl: `http://127.0.0.1:${portReservation.port}`,
     logs: [],
     ready: Promise.resolve(),
+    portReservation,
   }
 
   sessions.set(id, session)
@@ -853,10 +860,14 @@ function normalizeModelToken(value: string) {
 }
 
 async function prepareSession(session: BuilderSession) {
-  await fs.mkdir(session.projectPath, { recursive: true })
-  await writeGeneratedApp(session.projectPath)
-  await runCommand("pnpm", ["install"], session)
-  await startDevServer(session)
+  try {
+    await fs.mkdir(session.projectPath, { recursive: true })
+    await writeGeneratedApp(session.projectPath)
+    await runCommand("pnpm", ["install"], session)
+    await startDevServer(session)
+  } finally {
+    await releasePortReservation(session)
+  }
 }
 
 async function writeGeneratedApp(projectPath: string) {
@@ -870,9 +881,14 @@ async function writeGeneratedApp(projectPath: string) {
 }
 
 async function startDevServer(session: BuilderSession) {
-  if (session.devProcess && !session.devProcess.killed) {
+  if (isPreviewProcessAlive(session.devProcess)) {
     return
   }
+
+  // Drop the reservation immediately before spawn so Vite can bind the same
+  // port. Holding it through `pnpm install` is what prevents two sessions
+  // from being assigned the same free port.
+  await releasePortReservation(session)
 
   const child = spawn(
     "pnpm",
@@ -897,10 +913,28 @@ async function startDevServer(session: BuilderSession) {
 
   child.once("exit", (code) => {
     session.logs.push(`vite exited with code ${code ?? "unknown"}`)
-    session.devProcess = undefined
+    if (session.devProcess === child) {
+      session.devProcess = undefined
+    }
   })
 
-  await waitForPort(session.port)
+  try {
+    await waitForPreviewPort(session.port, {
+      isAlive: () => isPreviewProcessAlive(child),
+    })
+  } catch (error) {
+    if (session.devProcess === child) {
+      session.devProcess = undefined
+    }
+    child.kill("SIGTERM")
+    throw error
+  }
+}
+
+async function releasePortReservation(session: BuilderSession) {
+  const reservation = session.portReservation
+  session.portReservation = undefined
+  await reservation?.release()
 }
 
 function runCommand(
@@ -947,49 +981,6 @@ function pipeProcessLogs(
 
   child.stdout.on("data", append)
   child.stderr.on("data", append)
-}
-
-function waitForPort(port: number, timeoutMs = 30_000): Promise<void> {
-  const startedAt = Date.now()
-
-  return new Promise((resolve, reject) => {
-    const attempt = () => {
-      const socket = net.connect(port, "127.0.0.1")
-      socket.once("connect", () => {
-        socket.end()
-        resolve()
-      })
-      socket.once("error", () => {
-        socket.destroy()
-        if (Date.now() - startedAt > timeoutMs) {
-          reject(new Error(`Timed out waiting for preview server on ${port}.`))
-          return
-        }
-        setTimeout(attempt, 250)
-      })
-    }
-
-    attempt()
-  })
-}
-
-function getAvailablePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer()
-    server.unref()
-    server.once("error", reject)
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address()
-      server.close(() => {
-        if (!address || typeof address === "string") {
-          reject(new Error("Could not allocate a preview port."))
-          return
-        }
-
-        resolve(address.port)
-      })
-    })
-  })
 }
 
 async function getOrCreateAgent(session: BuilderSession) {
