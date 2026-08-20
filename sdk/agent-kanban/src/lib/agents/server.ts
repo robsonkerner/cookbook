@@ -5,6 +5,10 @@ import path from "node:path"
 
 import { Agent, Cursor } from "@cursor/sdk"
 
+import {
+  getArtifactPreviewKind,
+  resolveServedArtifactContentType,
+} from "./artifact-media"
 import type {
   AgentCard,
   AgentListResponse,
@@ -441,33 +445,27 @@ export async function readArtifactContent(
         throw new Error("Artifact download URL returned an error.")
       }
 
-      return {
-        bytes: new Uint8Array(await artifactResponse.arrayBuffer()),
-        contentType:
-          artifactResponse.headers.get("content-type") ??
-          contentTypeForArtifactPath(artifactPath),
-      }
+      return servedArtifactContent(
+        artifactPath,
+        new Uint8Array(await artifactResponse.arrayBuffer()),
+        artifactResponse.headers.get("content-type")
+      )
     }
 
     if (response instanceof ArrayBuffer) {
-      return {
-        bytes: new Uint8Array(response),
-        contentType: contentTypeForArtifactPath(artifactPath),
-      }
+      return servedArtifactContent(artifactPath, new Uint8Array(response))
     }
 
     if (response instanceof Uint8Array) {
-      return {
-        bytes: response,
-        contentType: contentTypeForArtifactPath(artifactPath),
-      }
+      return servedArtifactContent(artifactPath, response)
     }
 
     if (response instanceof Blob) {
-      return {
-        bytes: new Uint8Array(await response.arrayBuffer()),
-        contentType: response.type || contentTypeForArtifactPath(artifactPath),
-      }
+      return servedArtifactContent(
+        artifactPath,
+        new Uint8Array(await response.arrayBuffer()),
+        response.type
+      )
     }
   } finally {
     await disposeAgent(agent)
@@ -918,55 +916,18 @@ function labelFromRepositoryString(value: string) {
     .replace(/\.git$/, "")
 }
 
-function getArtifactPreviewKind(
+function servedArtifactContent(
   artifactPath: string,
-  contentType?: string
-): ArtifactPreview["previewKind"] {
-  if (
-    contentType?.startsWith("video/") ||
-    /\.(mov|mp4|m4v|webm)$/i.test(artifactPath)
-  ) {
-    return "video"
+  bytes: Uint8Array,
+  upstreamContentType?: string | null
+): { bytes: Uint8Array; contentType: string } {
+  return {
+    bytes,
+    contentType: resolveServedArtifactContentType(
+      artifactPath,
+      upstreamContentType
+    ).contentType,
   }
-
-  if (contentType?.startsWith("image/")) {
-    return "image"
-  }
-
-  if (/\.(avif|gif|jpe?g|png|svg|webp)$/i.test(artifactPath)) {
-    return "image"
-  }
-
-  return "file"
-}
-
-function contentTypeForArtifactPath(artifactPath: string) {
-  const normalized = artifactPath.toLowerCase()
-  if (normalized.endsWith(".mp4") || normalized.endsWith(".m4v")) {
-    return "video/mp4"
-  }
-  if (normalized.endsWith(".mov")) {
-    return "video/quicktime"
-  }
-  if (normalized.endsWith(".webm")) {
-    return "video/webm"
-  }
-  if (normalized.endsWith(".png")) {
-    return "image/png"
-  }
-  if (normalized.endsWith(".jpg") || normalized.endsWith(".jpeg")) {
-    return "image/jpeg"
-  }
-  if (normalized.endsWith(".webp")) {
-    return "image/webp"
-  }
-  if (normalized.endsWith(".gif")) {
-    return "image/gif"
-  }
-  if (normalized.endsWith(".svg")) {
-    return "image/svg+xml"
-  }
-  return "application/octet-stream"
 }
 
 function isNodeFileError(error: unknown): error is NodeJS.ErrnoException {
