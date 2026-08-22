@@ -15,6 +15,11 @@ import {
   type SDKModel,
 } from "@cursor/sdk"
 
+import {
+  buildProjectNameAgentOptions,
+  createProjectNameWorkspace,
+  disposeProjectNameAgent,
+} from "./project-name-agent"
 import { generatedAppFiles } from "./template"
 
 type BuilderSession = {
@@ -334,13 +339,16 @@ async function promptProjectNameWithXml(
     }, getProjectNameTimeoutMs())
   })
 
-  const agent = Agent.create({
-    apiKey,
-    model: { id: process.env.CURSOR_PROJECT_NAME_MODEL ?? "composer-2" },
-  })
+  const workspacePath = await createProjectNameWorkspace()
+  let agent: SDKAgent | undefined
+  let run: Run | undefined
 
   try {
-    const run = await agent.send(buildProjectNamePrompt(context))
+    // Agent.create is sync in SDK 1.0.7 and async in later 1.x releases.
+    agent = await Agent.create(
+      buildProjectNameAgentOptions(apiKey, workspacePath)
+    )
+    run = await agent.send(buildProjectNamePrompt(context))
 
     return await Promise.race([
       collectProjectNameRun(run, context),
@@ -350,7 +358,7 @@ async function promptProjectNameWithXml(
     if (timeout) {
       clearTimeout(timeout)
     }
-    agent.close()
+    await disposeProjectNameAgent(agent, run, workspacePath)
   }
 }
 
