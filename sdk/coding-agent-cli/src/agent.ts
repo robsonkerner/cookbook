@@ -41,12 +41,18 @@ type CloudRepository = {
   startingRef?: string
 }
 
+type CreateSdkAgent = (
+  options: Parameters<typeof Agent.create>[0]
+) => SDKAgent | Promise<SDKAgent>
+
 type CodingAgentSessionOptions = {
   apiKey: string
   cwd: string
   model: ModelSelection
   force: boolean
   executionMode?: ExecutionMode
+  /** Test seam: inject a create implementation that may return a Promise. */
+  createSdkAgent?: CreateSdkAgent
 }
 
 type SendPromptOptions = {
@@ -67,13 +73,14 @@ const AGENT_INSTRUCTIONS = [
 ].join("\n")
 
 export class CodingAgentSession {
-  private agent: SDKAgent
+  private agentReady: Promise<SDKAgent> | undefined
   private agentKey: string
   private cloudRepository: CloudRepository | null = null
   private currentRun: Run | null = null
   private readonly apiKey: string
   private readonly cwd: string
   private readonly force: boolean
+  private readonly createSdkAgent: CreateSdkAgent
   private mode: ExecutionMode
   private modelSelection: ModelSelection
 
@@ -83,7 +90,7 @@ export class CodingAgentSession {
     this.force = options.force
     this.mode = options.executionMode ?? "local"
     this.modelSelection = options.model
-    this.agent = this.createAgent()
+    this.createSdkAgent = options.createSdkAgent ?? Agent.create.bind(Agent)
     this.agentKey = this.currentAgentKey()
   }
 
@@ -141,7 +148,19 @@ export class CodingAgentSession {
   }
 
   async dispose() {
-    await this.agent[Symbol.asyncDispose]()
+    const pending = this.agentReady
+    this.agentReady = undefined
+
+    if (!pending) {
+      return
+    }
+
+    try {
+      const agent = await pending
+      await agent[Symbol.asyncDispose]()
+    } catch {
+      // Create may have failed; nothing left to dispose.
+    }
   }
 
   async cancelCurrentRun(): Promise<CancelRunResult> {
@@ -163,9 +182,9 @@ export class CodingAgentSession {
   }
 
   async sendPrompt({ prompt, onEvent }: SendPromptOptions) {
-    await this.ensureAgentFresh()
+    const agent = await this.ensureAgent()
 
-    const run = await this.agent.send(buildPrompt(prompt), {
+    const run = await agent.send(buildPrompt(prompt), {
       ...(this.mode === "local" ? { model: this.modelSelection } : {}),
       ...(this.mode === "local" && this.force ? { local: { force: true } } : {}),
     })
@@ -192,7 +211,7 @@ export class CodingAgentSession {
     }
   }
 
-  private createAgent() {
+  private async createAgent(): Promise<SDKAgent> {
     const options = {
       apiKey: this.apiKey,
       name: "Lightweight coding agent",
@@ -203,7 +222,8 @@ export class CodingAgentSession {
       const repository = detectCloudRepository(this.cwd)
       this.cloudRepository = repository
 
-      return Agent.create({
+      // Agent.create returned SDKAgent in 1.0.7 and Promise<SDKAgent> from 1.0.9.
+      return await this.createSdkAgent({
         ...options,
         cloud: {
           repos: [repository],
@@ -213,7 +233,7 @@ export class CodingAgentSession {
 
     this.cloudRepository = null
 
-    return Agent.create({
+    return await this.createSdkAgent({
       ...options,
       local: {
         cwd: this.cwd,
@@ -221,17 +241,45 @@ export class CodingAgentSession {
     })
   }
 
-  private async ensureAgentFresh() {
+  private async ensureAgent(): Promise<SDKAgent> {
     if (this.agentKey !== this.currentAgentKey()) {
-      await this.replaceAgent()
+      return this.replaceAgent()
     }
+
+    if (!this.agentReady) {
+      this.agentReady = this.createAgent()
+    }
+
+    return this.agentReady
   }
 
   private async replaceAgent() {
-    const previousAgent = this.agent
-    this.agent = this.createAgent()
+    const previousReady = this.agentReady
+    const previousKey = this.agentKey
+    const nextReady = this.createAgent()
+    this.agentReady = nextReady
     this.agentKey = this.currentAgentKey()
-    await previousAgent[Symbol.asyncDispose]()
+
+    try {
+      const next = await nextReady
+
+      if (previousReady) {
+        try {
+          const previous = await previousReady
+          await previous[Symbol.asyncDispose]()
+        } catch {
+          // Previous create/dispose failures should not block replacement.
+        }
+      }
+
+      return next
+    } catch (error) {
+      if (this.agentReady === nextReady) {
+        this.agentReady = previousReady
+        this.agentKey = previousKey
+      }
+      throw error
+    }
   }
 
   private currentAgentKey() {
